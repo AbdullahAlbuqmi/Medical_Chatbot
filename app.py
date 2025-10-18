@@ -1,11 +1,21 @@
 import requests
 from fastapi import FastAPI
 from pydantic import BaseModel
+from fastapi.middleware.cors import CORSMiddleware
 
 # ---------------------------
 # ✅ FastAPI Init
 # ---------------------------
 app = FastAPI(title="Medical AI Chatbots API")
+
+# ✅ ADD CORS MIDDLEWARE HERE
+app.add_middleware(
+    CORSMiddleware,
+    allow_origins=["*"],  # Allows all origins (or specify your frontend URL)
+    allow_credentials=True,
+    allow_methods=["*"],  # Allows all methods (POST, GET, etc.)
+    allow_headers=["*"],  # Allows all headers
+)
 
 import os
 HF_API_KEY = os.environ.get("HF_API_KEY")
