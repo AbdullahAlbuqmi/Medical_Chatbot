@@ -7,7 +7,8 @@ from pydantic import BaseModel
 # ---------------------------
 app = FastAPI(title="Medical AI Chatbots API")
 
-HF_API_KEY = "YOUR_HF_KEY_HERE"  # Replace or inject via env
+import os
+HF_API_KEY = os.environ.get("HF_API_KEY")
 API_URL = "https://router.huggingface.co/v1/chat/completions"
 HEADERS = {"Authorization": f"Bearer {HF_API_KEY}"}
 
