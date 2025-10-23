@@ -15,7 +15,7 @@ except Exception:
 
 # ---------- config & logging ----------
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(_name_)
+logger = logging.getLogger(__name__)
 
 # ---------- FastAPI Init ----------
 app = FastAPI(title="Medical AI Chatbots API")
