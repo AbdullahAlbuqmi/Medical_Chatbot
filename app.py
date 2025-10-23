@@ -1,14 +1,21 @@
 import os
 import requests
 import logging
+from typing import Any, Optional
+
 from fastapi import FastAPI
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
-from guardrails import Guard
+
+# Try import Guardrails; if missing, app still runs but guard will be disabled.
+try:
+    from guardrails import Guard
+except Exception:
+    Guard = None  # type: ignore
 
 # ---------- config & logging ----------
 logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
+logger = logging.getLogger(_name_)
 
 # ---------- FastAPI Init ----------
 app = FastAPI(title="Medical AI Chatbots API")
@@ -29,17 +36,26 @@ if not HF_API_KEY:
 API_URL = "https://router.huggingface.co/v1/chat/completions"
 HEADERS = {"Authorization": f"Bearer {HF_API_KEY}"} if HF_API_KEY else {}
 
-# Make sure medical_guard.rail path is correct relative to where you run the app
-guard = Guard.from_rail("medical_guard.rail")
+# load the rail file safely
+guard: Optional[Any] = None
+if Guard is not None:
+    try:
+        guard = Guard.from_rail("medical_guard.rail")
+        logger.info("Guardrails loaded from medical_guard.rail")
+    except Exception:
+        logger.exception("Failed to load medical_guard.rail — Guardrails disabled for now.")
+        guard = None
+else:
+    logger.warning("guardrails package not available. Install guardrails-ai to enable rules.")
 
 # ---------- Schema ----------
 class ChatRequest(BaseModel):
     user_input: str
     session_id: str
 
-# ---------- Histories ----------
-simple_history = {}
-advanced_history = {}
+# ---------- Histories (in-memory; replace with DB/Redis in production) ----------
+simple_history: dict = {}
+advanced_history: dict = {}
 
 # ---------- Prompts ----------
 SIMPLE_PROMPT = """
@@ -56,9 +72,74 @@ Ask follow-up questions if needed, no more than 3 questions, and provide advance
 Always state uncertainty and do not assume a final diagnosis without full context.
 """
 
+# ---------- Helper: extract a safe string from Guardrails output ----------
+def _extract_reply_from_validated(validated_output: Any) -> Optional[str]:
+    """
+    Try multiple strategies to extract a string reply from validated_output.
+    Return None if extraction failed.
+    """
+    # 1) If it's already a dict-like
+    try:
+        if isinstance(validated_output, dict):
+            return validated_output.get("reply") or validated_output.get("answer") or validated_output.get("response")
+    except Exception:
+        pass
+
+    # 2) If supports item access (some versions)
+    try:
+        reply = validated_output["reply"]
+        if isinstance(reply, str):
+            return reply
+        else:
+            return str(reply)
+    except Exception:
+        pass
+
+    # 3) Attribute access
+    try:
+        reply = getattr(validated_output, "reply", None)
+        if isinstance(reply, str):
+            return reply
+        if reply is not None:
+            return str(reply)
+    except Exception:
+        pass
+
+    # 4) Look for .value() or .dict() (pydantic models)
+    try:
+        if hasattr(validated_output, "dict"):
+            d = validated_output.dict()
+            return d.get("reply") or d.get("answer") or d.get("response") or None
+    except Exception:
+        pass
+
+    try:
+        if hasattr(validated_output, "value"):
+            val = validated_output.value
+            if isinstance(val, str):
+                return val
+            if isinstance(val, dict):
+                return val.get("reply") or val.get("answer") or None
+    except Exception:
+        pass
+
+    # 5) Fallback to stringifying (for debug only) — but prefer None so caller can return safe message
+    try:
+        s = str(validated_output)
+        if s and len(s.strip()) > 0:
+            return s
+    except Exception:
+        pass
+
+    return None
+
 # ---------- Helper LLM Call ----------
-def call_deepseek(history):
-    # call HF
+def call_deepseek(history: list) -> str:
+    """
+    Send conversation history to HF model, validate with Guardrails if available,
+    and always return a safe string (never return a raw object).
+    """
+    # 1) Call HF API
     try:
         resp = requests.post(
             API_URL,
@@ -70,19 +151,19 @@ def call_deepseek(history):
         logger.exception("Request to HF failed")
         return "Sorry, the model service is currently unavailable."
 
-    # parse JSON
+    # 2) Parse JSON
     try:
         result = resp.json()
     except Exception:
-        logger.error("HF response is not JSON. status=%s text=%s", resp.status_code, resp.text)
+        logger.error("HF response is not JSON. status=%s text=%s", getattr(resp, "status_code", None), getattr(resp, "text", None))
         return "Sorry, the model returned an unexpected response."
 
-    # check HF error
+    # 3) Check HF error shape
     if isinstance(result, dict) and "error" in result:
         logger.error("HF API returned an error: %s", result["error"])
         return "Sorry, the model service returned an error."
 
-    # extract raw reply robustly
+    # 4) Extract raw reply robustly
     try:
         raw_reply = result["choices"][0]["message"]["content"]
     except Exception:
@@ -91,62 +172,46 @@ def call_deepseek(history):
 
     logger.info("RAW_REPLY (truncated): %s", raw_reply[:400])
 
-    # validate with Guardrails
-    try:
-        validated_output = guard.parse(raw_reply)
-    except Exception:
-        logger.exception("Guardrails parse() raised an exception")
-        return "Sorry, I cannot provide that information right now. Please consult a healthcare professional."
-
-    # extract final reply from validated_output (multiple fallbacks)
-    reply_text = None
-
-    # If it's a dict-like
-    try:
-        if isinstance(validated_output, dict):
-            reply_text = validated_output.get("reply") or validated_output.get("answer")
-    except Exception:
-        pass
-
-    # If supports item access
-    if reply_text is None:
+    # 5) If Guardrails available, validate
+    if guard is not None:
         try:
-            reply_text = validated_output["reply"]
+            validated_output = guard.parse(raw_reply)
         except Exception:
-            pass
+            logger.exception("Guardrails parse() raised an exception")
+            return "Sorry, I cannot provide that information right now. Please consult a healthcare professional."
 
-    # If attribute access
-    if reply_text is None:
-        reply_text = getattr(validated_output, "reply", None)
-
-    # Some Guardrails versions wrap result in .value or .content
-    if reply_text is None:
-        candidate = getattr(validated_output, "value", None) or getattr(validated_output, "content", None)
-        if isinstance(candidate, dict):
-            reply_text = candidate.get("reply") or candidate.get("answer")
-        elif isinstance(candidate, str):
-            reply_text = candidate
-
-    # final fallback (do not return raw_reply directly if unsafe)
-    if not reply_text:
-        logger.warning(
-            "Could not extract 'reply' from validated_output. type=%s dir(sample)=%s",
-            type(validated_output),
-            dir(validated_output)[:50],
-        )
-        return "Sorry, I cannot provide that information. Please consult a healthcare professional."
-
-    return reply_text
+        reply_text = _extract_reply_from_validated(validated_output)
+        if reply_text:
+            return reply_text
+        else:
+            logger.warning("Guardrails validated output but no 'reply' could be extracted. validated_output type=%s", type(validated_output))
+            return "Sorry, I cannot provide that information. Please consult a healthcare professional."
+    else:
+        # If guard not loaded: return a safe truncated raw reply and append reminder
+        safe = (raw_reply.strip()[:200] + "...") if len(raw_reply) > 200 else raw_reply.strip()
+        return f"{safe}\n\n⚠ Note: Validation rules are not loaded. Please consult a healthcare professional for final advice."
 
 # ---------- Endpoints ----------
 @app.post("/simple_chat")
 def simple_chat(req: ChatRequest):
+    # initialize history for session
     if req.session_id not in simple_history:
         simple_history[req.session_id] = [{"role": "system", "content": SIMPLE_PROMPT}]
 
+    # append user message
     simple_history[req.session_id].append({"role": "user", "content": req.user_input})
+
+    # call model
     reply = call_deepseek(simple_history[req.session_id])
+
+    # ensure reply is string
+    if not isinstance(reply, str):
+        logger.warning("Reply not string, converting. type=%s", type(reply))
+        reply = str(reply)
+
+    # append assistant reply to history as plain text
     simple_history[req.session_id].append({"role": "assistant", "content": reply})
+
     return {"reply": reply}
 
 
@@ -157,5 +222,10 @@ def advanced_chat(req: ChatRequest):
 
     advanced_history[req.session_id].append({"role": "user", "content": req.user_input})
     reply = call_deepseek(advanced_history[req.session_id])
+
+    if not isinstance(reply, str):
+        logger.warning("Reply not string, converting. type=%s", type(reply))
+        reply = str(reply)
+
     advanced_history[req.session_id].append({"role": "assistant", "content": reply})
     return {"reply": reply}
