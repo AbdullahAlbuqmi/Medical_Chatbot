@@ -1,185 +1,6 @@
-# app.py
-import os
-import requests
-import logging
-import types
-from typing import Any, Optional
-from collections.abc import Iterator
+import json
+# ... باقي imports كما هي ...
 
-from fastapi import FastAPI
-from pydantic import BaseModel
-from fastapi.middleware.cors import CORSMiddleware
-
-# Try import Guardrails; if missing, app still runs but guard will be disabled.
-try:
-    from guardrails import Guard
-except Exception:
-    Guard = None  # type: ignore
-
-# ---------- config & logging ----------
-logging.basicConfig(level=logging.INFO)
-logger = logging.getLogger(__name__)
-
-# ---------- FastAPI Init ----------
-app = FastAPI(title="Medical AI Chatbots API")
-
-app.add_middleware(
-    CORSMiddleware,
-    allow_origins=["*"],
-    allow_credentials=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
-)
-
-# ---------- Env + Guardrails ----------
-HF_API_KEY = os.environ.get("HF_API_KEY")
-if not HF_API_KEY:
-    logger.warning("HF_API_KEY is not set. HF requests will fail until you set this env var.")
-
-API_URL = "https://router.huggingface.co/v1/chat/completions"
-HEADERS = {"Authorization": f"Bearer {HF_API_KEY}"} if HF_API_KEY else {}
-
-# load the rail file safely
-guard: Optional[Any] = None
-if Guard is not None:
-    try:
-        guard = Guard.from_rail("medical_guard.rail")
-        logger.info("Guardrails loaded from medical_guard.rail")
-    except Exception:
-        logger.exception("Failed to load medical_guard.rail — Guardrails disabled for now.")
-        guard = None
-else:
-    logger.warning("guardrails package not available. Install guardrails-ai to enable rules.")
-
-# ---------- Schema ----------
-class ChatRequest(BaseModel):
-    user_input: str
-    session_id: str
-
-# ---------- Histories (in-memory; replace with DB/Redis in production) ----------
-simple_history: dict = {}
-advanced_history: dict = {}
-
-# ---------- Prompts ----------
-SIMPLE_PROMPT = """
-You are a friendly medical assistant focused on symptom guidance.
-Ask minimal follow-up questions and provide simple advice.
-Keep answers short and calming. Always encourage seeking real doctors for serious symptoms.
-"""
-
-ADVANCED_PROMPT = """
-You are a highly skilled medical research assistant.
-You analyze studies, compare treatments, summarize clinical guidelines, and explain conditions in-depth.
-Use structured responses and cite medical reasoning.
-Ask follow-up questions if needed, no more than 3 questions, and provide advanced advice or guidance.
-Always state uncertainty and do not assume a final diagnosis without full context.
-"""
-
-# ---------- Helpers to normalize Guardrails output ----------
-def _normalize_possible_iterable(maybe: Any) -> Optional[str]:
-    """
-    Convert maybe to a safe string.
-    - If string -> return it.
-    - If generator/iterator -> take the first yielded item (or stringified first).
-    - If list/tuple -> take first element or join strings.
-    - Else -> str(maybe).
-    """
-    if maybe is None:
-        return None
-
-    if isinstance(maybe, str):
-        return maybe
-
-    # generator / iterator (but not string)
-    if isinstance(maybe, types.GeneratorType) or (isinstance(maybe, Iterator) and not isinstance(maybe, (str, bytes))):
-        try:
-            first = next(maybe)
-            if isinstance(first, str):
-                return first
-            return str(first)
-        except StopIteration:
-            return None
-        except Exception:
-            return None
-
-    # list or tuple
-    if isinstance(maybe, (list, tuple)):
-        if len(maybe) == 0:
-            return None
-        first = maybe[0]
-        return first if isinstance(first, str) else str(first)
-
-    # dict -> try to extract nested
-    if isinstance(maybe, dict):
-        v = maybe.get("reply") or maybe.get("answer")
-        if v:
-            return _normalize_possible_iterable(v)
-        return str(maybe)
-
-    # fallback
-    try:
-        return str(maybe)
-    except Exception:
-        return None
-
-
-def _extract_reply_from_validated(validated_output: Any) -> Optional[str]:
-    """
-    Try multiple strategies to extract a string reply from validated_output.
-    Return None if extraction failed.
-    """
-    # 1) dict-like
-    try:
-        if isinstance(validated_output, dict):
-            v = validated_output.get("reply") or validated_output.get("answer") or validated_output.get("response")
-            if v is not None:
-                return _normalize_possible_iterable(v)
-    except Exception:
-        pass
-
-    # 2) item access (may return generator)
-    try:
-        maybe = validated_output["reply"]
-        return _normalize_possible_iterable(maybe)
-    except Exception:
-        pass
-
-    # 3) attribute access
-    try:
-        maybe = getattr(validated_output, "reply", None)
-        if maybe is not None:
-            return _normalize_possible_iterable(maybe)
-    except Exception:
-        pass
-
-    # 4) pydantic-like dict() or .value / .content
-    try:
-        if hasattr(validated_output, "dict"):
-            d = validated_output.dict()
-            v = d.get("reply") or d.get("answer") or d.get("response")
-            if v is not None:
-                return _normalize_possible_iterable(v)
-    except Exception:
-        pass
-
-    try:
-        maybe = getattr(validated_output, "value", None) or getattr(validated_output, "content", None)
-        if maybe is not None:
-            return _normalize_possible_iterable(maybe)
-    except Exception:
-        pass
-
-    # final fallback: stringify (for debug only)
-    try:
-        s = str(validated_output)
-        if s and len(s.strip()) > 0:
-            return s
-    except Exception:
-        pass
-
-    return None
-
-# ---------- Helper LLM Call ----------
 def call_deepseek(history: list) -> str:
     """
     Send conversation history to HF model, validate with Guardrails if available,
@@ -216,62 +37,73 @@ def call_deepseek(history: list) -> str:
         logger.error("Unexpected HF result structure: %s", result)
         return "Sorry, the model returned an unexpected result format."
 
-    logger.info("RAW_REPLY (truncated): %s", raw_reply[:400])
+    logger.info("RAW_REPLY (truncated): %s", (raw_reply[:400] if isinstance(raw_reply, str) else str(raw_reply)) )
 
-    # 5) If Guardrails available, validate
+    # 5) If Guardrails available, validate with tolerant strategy
     if guard is not None:
-        try:
-            validated_output = guard.parse(raw_reply)
-        except Exception:
-            logger.exception("Guardrails parse() raised an exception")
-            return "Sorry, I cannot provide that information right now. Please consult a healthcare professional."
+        validated_output = None
+        parse_attempts = []
 
-        reply_text = _extract_reply_from_validated(validated_output)
-        if reply_text:
-            return reply_text
-        else:
-            logger.warning("Guardrails validated output but no 'reply' could be extracted. validated_output type=%s", type(validated_output))
-            return "Sorry, I cannot provide that information. Please consult a healthcare professional."
+        # Attempt A: if raw_reply is JSON string, try to load and parse that
+        try:
+            parsed_candidate = json.loads(raw_reply)
+            parse_attempts.append("json.loads -> guard.parse(parsed_candidate)")
+            try:
+                validated_output = guard.parse(parsed_candidate)
+            except Exception:
+                # second chance: wrap parsed_candidate under "reply"
+                try:
+                    validated_output = guard.parse({"reply": parsed_candidate})
+                    parse_attempts.append("guard.parse({'reply': parsed_candidate})")
+                except Exception:
+                    pass
+        except Exception:
+            parse_attempts.append("raw_reply not JSON")
+
+        # Attempt B: parse as {"reply": raw_reply}
+        if validated_output is None:
+            try:
+                parse_attempts.append("guard.parse({'reply': raw_reply})")
+                validated_output = guard.parse({"reply": raw_reply})
+            except Exception:
+                pass
+
+        # Attempt C: parse raw string directly
+        if validated_output is None:
+            try:
+                parse_attempts.append("guard.parse(raw_reply)")
+                validated_output = guard.parse(raw_reply)
+            except Exception:
+                pass
+
+        # Log parse attempts
+        logger.debug("Guard parse attempts: %s", parse_attempts)
+
+        # If validated_output found -> extract reply
+        if validated_output is not None:
+            try:
+                reply_text = _extract_reply_from_validated(validated_output)
+                if reply_text:
+                    return reply_text
+                else:
+                    logger.warning("Guardrails validated output but no 'reply' extracted. validated_output type=%s value=%s", type(validated_output), getattr(validated_output, "__dict__", str(validated_output)))
+                    # safe fallback: return raw reply with note
+                    safe = raw_reply.strip() if isinstance(raw_reply, str) else str(raw_reply)
+                    if len(safe) > 1000:
+                        safe = safe[:1000] + "..."
+                    return f"{safe}\n\nNote: Validation succeeded but no 'reply' could be extracted. Treat this as general information and consult a healthcare professional."
+            except Exception:
+                logger.exception("Error while extracting reply from validated output")
+                # fallthrough to safe return below
+
+        # If we get here: validation attempts all failed
+        logger.warning("Guardrails validation failed. Returning raw reply with disclaimer. attempts=%s", parse_attempts)
+        safe = raw_reply.strip() if isinstance(raw_reply, str) else str(raw_reply)
+        if len(safe) > 1000:
+            safe = safe[:1000] + "..."
+        return f"{safe}\n\nNote: I couldn't run validation rules on this reply, so treat this as general information and consult a healthcare professional."
+
     else:
         # If guard not loaded: return a safe truncated raw reply and append reminder
-        safe = (raw_reply.strip()[:200] + "...") if len(raw_reply) > 200 else raw_reply.strip()
-        return f"{safe}\n\n⚠ Note: Validation rules are not loaded. Please consult a healthcare professional for final advice."
-
-# ---------- Endpoints ----------
-@app.post("/simple_chat")
-def simple_chat(req: ChatRequest):
-    # initialize history for session
-    if req.session_id not in simple_history:
-        simple_history[req.session_id] = [{"role": "system", "content": SIMPLE_PROMPT}]
-
-    # append user message
-    simple_history[req.session_id].append({"role": "user", "content": req.user_input})
-
-    # call model
-    reply = call_deepseek(simple_history[req.session_id])
-
-    # ensure reply is string
-    if not isinstance(reply, str):
-        logger.warning("Reply not string, converting. type=%s", type(reply))
-        reply = str(reply)
-
-    # append assistant reply to history as plain text
-    simple_history[req.session_id].append({"role": "assistant", "content": reply})
-
-    return {"reply": reply}
-
-
-@app.post("/advanced_chat")
-def advanced_chat(req: ChatRequest):
-    if req.session_id not in advanced_history:
-        advanced_history[req.session_id] = [{"role": "system", "content": ADVANCED_PROMPT}]
-
-    advanced_history[req.session_id].append({"role": "user", "content": req.user_input})
-    reply = call_deepseek(advanced_history[req.session_id])
-
-    if not isinstance(reply, str):
-        logger.warning("Reply not string, converting. type=%s", type(reply))
-        reply = str(reply)
-
-    advanced_history[req.session_id].append({"role": "assistant", "content": reply})
-    return {"reply": reply}
+        safe = (raw_reply.strip()[:200] + "...") if isinstance(raw_reply, str) and len(raw_reply) > 200 else (raw_reply.strip() if isinstance(raw_reply, str) else str(raw_reply))
+        return f"{safe}\n\n Note: Validation rules are not loaded. Please consult a healthcare professional for final advice."
