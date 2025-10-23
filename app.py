@@ -1,7 +1,10 @@
+# app.py
 import os
 import requests
 import logging
+import types
 from typing import Any, Optional
+from collections.abc import Iterator
 
 from fastapi import FastAPI
 from pydantic import BaseModel
@@ -72,58 +75,101 @@ Ask follow-up questions if needed, no more than 3 questions, and provide advance
 Always state uncertainty and do not assume a final diagnosis without full context.
 """
 
-# ---------- Helper: extract a safe string from Guardrails output ----------
+# ---------- Helpers to normalize Guardrails output ----------
+def _normalize_possible_iterable(maybe: Any) -> Optional[str]:
+    """
+    Convert maybe to a safe string.
+    - If string -> return it.
+    - If generator/iterator -> take the first yielded item (or stringified first).
+    - If list/tuple -> take first element or join strings.
+    - Else -> str(maybe).
+    """
+    if maybe is None:
+        return None
+
+    if isinstance(maybe, str):
+        return maybe
+
+    # generator / iterator (but not string)
+    if isinstance(maybe, types.GeneratorType) or (isinstance(maybe, Iterator) and not isinstance(maybe, (str, bytes))):
+        try:
+            first = next(maybe)
+            if isinstance(first, str):
+                return first
+            return str(first)
+        except StopIteration:
+            return None
+        except Exception:
+            return None
+
+    # list or tuple
+    if isinstance(maybe, (list, tuple)):
+        if len(maybe) == 0:
+            return None
+        first = maybe[0]
+        return first if isinstance(first, str) else str(first)
+
+    # dict -> try to extract nested
+    if isinstance(maybe, dict):
+        v = maybe.get("reply") or maybe.get("answer")
+        if v:
+            return _normalize_possible_iterable(v)
+        return str(maybe)
+
+    # fallback
+    try:
+        return str(maybe)
+    except Exception:
+        return None
+
+
 def _extract_reply_from_validated(validated_output: Any) -> Optional[str]:
     """
     Try multiple strategies to extract a string reply from validated_output.
     Return None if extraction failed.
     """
-    # 1) If it's already a dict-like
+    # 1) dict-like
     try:
         if isinstance(validated_output, dict):
-            return validated_output.get("reply") or validated_output.get("answer") or validated_output.get("response")
+            v = validated_output.get("reply") or validated_output.get("answer") or validated_output.get("response")
+            if v is not None:
+                return _normalize_possible_iterable(v)
     except Exception:
         pass
 
-    # 2) If supports item access (some versions)
+    # 2) item access (may return generator)
     try:
-        reply = validated_output["reply"]
-        if isinstance(reply, str):
-            return reply
-        else:
-            return str(reply)
+        maybe = validated_output["reply"]
+        return _normalize_possible_iterable(maybe)
     except Exception:
         pass
 
-    # 3) Attribute access
+    # 3) attribute access
     try:
-        reply = getattr(validated_output, "reply", None)
-        if isinstance(reply, str):
-            return reply
-        if reply is not None:
-            return str(reply)
+        maybe = getattr(validated_output, "reply", None)
+        if maybe is not None:
+            return _normalize_possible_iterable(maybe)
     except Exception:
         pass
 
-    # 4) Look for .value() or .dict() (pydantic models)
+    # 4) pydantic-like dict() or .value / .content
     try:
         if hasattr(validated_output, "dict"):
             d = validated_output.dict()
-            return d.get("reply") or d.get("answer") or d.get("response") or None
+            v = d.get("reply") or d.get("answer") or d.get("response")
+            if v is not None:
+                return _normalize_possible_iterable(v)
     except Exception:
         pass
 
     try:
-        if hasattr(validated_output, "value"):
-            val = validated_output.value
-            if isinstance(val, str):
-                return val
-            if isinstance(val, dict):
-                return val.get("reply") or val.get("answer") or None
+        maybe = getattr(validated_output, "value", None) or getattr(validated_output, "content", None)
+        if maybe is not None:
+            return _normalize_possible_iterable(maybe)
     except Exception:
         pass
 
-    # 5) Fallback to stringifying (for debug only) — but prefer None so caller can return safe message
+    # final fallback: stringify (for debug only)
     try:
         s = str(validated_output)
         if s and len(s.strip()) > 0:
@@ -137,7 +183,7 @@ def _extract_reply_from_validated(validated_output: Any) -> Optional[str]:
 def call_deepseek(history: list) -> str:
     """
     Send conversation history to HF model, validate with Guardrails if available,
-    and always return a safe string (never return a raw object).
+    and always return a safe string (never return raw objects).
     """
     # 1) Call HF API
     try:
