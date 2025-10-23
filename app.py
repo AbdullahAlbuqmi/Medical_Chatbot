@@ -51,22 +51,88 @@ Always state uncertainty and do not assume a final diagnosis without full contex
 """
 
 # Helper LLM Call
+# ________________________________________________________
+import logging
+
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(_name_)
 
 def call_deepseek(history):
-    response = requests.post(API_URL, headers=HEADERS, json={
-        "messages": history,
-        "model": "deepseek-ai/DeepSeek-V3.2-Exp:novita"
-    })
-    result = response.json()
-    raw_reply = result["choices"][0]["message"]["content"]
+   
+    try:
+        resp = requests.post(API_URL, headers=HEADERS, json={
+            "messages": history,
+            "model": "deepseek-ai/DeepSeek-V3.2-Exp:novita"
+        }, timeout=20)
+    except Exception as e:
+        logger.exception("Request to HF failed")
+        return "Sorry, the model service is currently unavailable."
 
-    # Apply Guardrails Validation
+
+    try:
+        result = resp.json()
+    except Exception:
+        logger.error("HF response is not JSON. Status code: %s, text: %s", resp.status_code, resp.text)
+        return "Sorry, the model returned an unexpected response."
+
+
+    if "error" in result:
+        logger.error("HF API returned an error: %s", result["error"])
+        return "Sorry, the model service returned an error."
+
+
+    try:
+        raw_reply = result["choices"][0]["message"]["content"]
+    except Exception:
+        logger.error("Unexpected HF result structure: %s", result)
+        return "Sorry, the model returned an unexpected result format."
+
+    logger.info("RAW_REPLY: %s", raw_reply[:400])  
+
+
     try:
         validated_output = guard.parse(raw_reply)
-        return validated_output["reply"]
-    except Exception:
-        return "Sorry, I cannot provide that information."
+    except Exception as e:
+        logger.exception("Guardrails parse() raised an exception")
 
+        return "Sorry, I cannot provide that information right now. Please consult a healthcare professional."
+
+    reply_text = None
+
+  
+    try:
+        if isinstance(validated_output, dict):
+            reply_text = validated_output.get("reply")
+    except Exception:
+        pass
+
+
+    if reply_text is None:
+        try:
+            reply_text = validated_output["reply"]
+        except Exception:
+            pass
+
+    if reply_text is None:
+        reply_text = getattr(validated_output, "reply", None)
+
+    if reply_text is None:
+        candidate = getattr(validated_output, "value", None) or getattr(validated_output, "content", None)
+        if isinstance(candidate, dict):
+            reply_text = candidate.get("reply") or candidate.get("answer")
+        elif isinstance(candidate, str):
+            reply_text = candidate
+
+
+    if not reply_text:
+        logger.warning("Could not extract 'reply' from validated_output. validated_output type=%s dir=%s",
+                       type(validated_output), dir(validated_output)[:50])
+
+        return "Sorry, I cannot provide that information. ⚠ Please consult a healthcare professional."
+
+    return reply_text
+
+# ________________________________________________________
 
 # Endpoint 1: Simple Chatbot
 @app.post("/simple_chat")
