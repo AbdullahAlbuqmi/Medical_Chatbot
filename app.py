@@ -158,4 +158,4 @@ def advanced_chat(req: ChatRequest):
     advanced_history[req.session_id].append({"role": "user", "content": req.user_input})
     reply = call_deepseek(advanced_history[req.session_id])
     advanced_history[req.session_id].append({"role": "assistant", "content": reply})
-    return {"reply": reply}
+    return {"reply": reply}
