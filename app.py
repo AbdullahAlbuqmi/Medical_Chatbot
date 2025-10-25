@@ -24,10 +24,10 @@ app.add_middleware(
 )
 
 # إعداد المتغيرات البيئية
-API_URL = os.getenv("HF_API_URL", "https://api-inference.huggingface.co/models/deepseek-ai/DeepSeek-V3.2-Exp")
+API_URL = "https://router.huggingface.co/v1/chat/completions"
 HF_TOKEN = os.getenv("HF_TOKEN", "your_token_here")
 
-HEADERS = {
+headers = {
     "Authorization": f"Bearer {HF_TOKEN}",
     "Content-Type": "application/json"
 }
@@ -80,52 +80,61 @@ def _extract_reply_from_validated(validated_output):
         logger.error(f"Error extracting reply: {e}")
         return None
 
-# دالة الاتصال بـ DeepSeek
+# دالة الاتصال بـ DeepSeek المحدثة
 def call_deepseek(history: list) -> str:
-    """إرسال تاريخ المحادثة إلى نموذج HF"""
+    """إرسال تاريخ المحادثة إلى نموذج HF باستخدام الـ endpoint الجديد"""
     
-    # 1) استدعاء HF API
     try:
-        resp = requests.post(
-            API_URL,
-            headers=HEADERS,
-            json={
-                "messages": history, 
-                "max_tokens": 500,
-                "temperature": 0.7
-            },
-            timeout=30,
+        payload = {
+            "messages": history,
+            "model": "deepseek-ai/DeepSeek-V3.2-Exp:novita",
+            "max_tokens": 500,
+            "temperature": 0.7
+        }
+        
+        logger.info(f"Sending request to HF API: {payload}")
+        
+        response = requests.post(
+            API_URL, 
+            headers=headers, 
+            json=payload,
+            timeout=30
         )
-        resp.raise_for_status()
+        
+        logger.info(f"HF API Status: {response.status_code}")
+        
+        if response.status_code != 200:
+            logger.error(f"HF API Error: {response.status_code} - {response.text}")
+            if response.status_code == 401:
+                return "خطأ في المصادقة. يرجى التحقق من الـ API token."
+            elif response.status_code == 429:
+                return "تم تجاوز الحد المسموح. يرجى المحاولة لاحقاً."
+            else:
+                return f"خطأ من الخادم: {response.status_code}"
+        
+        result = response.json()
+        logger.info(f"HF API Response: {result}")
+        
+        # استخراج الرد من الهيكل الجديد
+        raw_reply = result["choices"][0]["message"]["content"]
+        logger.info(f"RAW_REPLY: {raw_reply[:200]}...")
+        
+    except requests.exceptions.Timeout:
+        logger.error("Request timeout")
+        return "المهلة انتهت. يرجى المحاولة مرة أخرى."
+    except requests.exceptions.ConnectionError:
+        logger.error("Connection error")
+        return "خطأ في الاتصال. يرجى التحقق من الإنترنت والمحاولة مرة أخرى."
+    except KeyError as e:
+        logger.error(f"Unexpected response structure: {e}")
+        return "عذراً، النموذج أعاد تنسيق نتيجة غير متوقع."
     except Exception as e:
         logger.exception(f"Request to HF failed: {e}")
         return "عذراً، خدمة النموذج غير متاحة حالياً."
 
-    # 2) تحليل JSON
-    try:
-        result = resp.json()
-    except Exception as e:
-        logger.error(f"HF response is not JSON: {e}")
-        return "عذراً، النموذج أعاد استجابة غير متوقعة."
-
-    # 3) التحقق من خطأ HF
-    if isinstance(result, dict) and "error" in result:
-        logger.error(f"HF API returned an error: {result['error']}")
-        return "عذراً، خدمة النموذج أعادت خطأ."
-
-    # 4) استخراج الرد الخام
-    try:
-        raw_reply = result[0]["generated_text"]
-    except Exception as e:
-        logger.error(f"Unexpected HF result structure: {result}, error: {e}")
-        return "عذراً، النموذج أعاد تنسيق نتيجة غير متوقع."
-
-    logger.info(f"RAW_REPLY: {raw_reply[:200]}...")
-
-    # 5) إذا كان Guardrails متاحاً، التحقق باستخدام استراتيجية متساهلة
+    # تطبيق Guardrails إذا كان شغال
     if guard is not None:
         try:
-            # محاولة التحقق باستخدام Guardrails
             validated_output = guard.parse(raw_reply)
             reply_text = _extract_reply_from_validated(validated_output)
             
@@ -139,9 +148,7 @@ def call_deepseek(history: list) -> str:
             logger.warning(f"Guardrails validation failed: {e}")
             return f"{raw_reply}\n\nملاحظة: لم أتمكن من التحقق من هذا الرد، لذا تعامل مع هذه المعلومات كإرشادات عامة واستشر متخصصاً طبياً."
     else:
-        # إذا لم يتم تحميل Guardrails
-        safe_reply = raw_reply[:500] + "..." if len(raw_reply) > 500 else raw_reply
-        return f"{safe_reply}\n\nملاحظة: قواعد التحقق غير محملة. يرجى استشارة متخصص طبي للنصيحة النهائية."
+        return raw_reply
 
 # endpoint الجذر
 @app.get("/")
