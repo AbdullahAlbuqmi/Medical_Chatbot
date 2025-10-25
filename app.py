@@ -34,9 +34,9 @@ headers = {
 # تحميل Guardrails من ملف medical_guard.rail
 try:
     guard = Guard.from_rail("medical_guard.rail")
-    logger.info("✅ Guardrails loaded successfully from medical_guard.rail")
+    logger.info(" Guardrails loaded successfully from medical_guard.rail")
 except Exception as e:
-    logger.error(f"❌ Failed to load Guardrails: {e}")
+    logger.error(f" Failed to load Guardrails: {e}")
     guard = None
 
 # نموذج البيانات
@@ -48,21 +48,27 @@ class ChatResponse(BaseModel):
     reply: str
     status: str
 
-# دالة مساعدة لاستخراج الرد من Guardrails output
-def _extract_reply_from_validated(validated_output):
-    """استخراج الرد من المخرجات المصدق عليها"""
+# دالة مبسطة لاستخراج الرد من Guardrails
+def _extract_reply(validation_outcome):
+    """استخراج الرد من نتيجة التحقق بشكل مبسط"""
     try:
-        if isinstance(validated_output, dict) and "reply" in validated_output:
-            return validated_output["reply"]
-        elif hasattr(validated_output, "reply"):
-            return validated_output.reply
-        else:
-            return str(validated_output)
+        # إذا كان هناك raw_llm_output، استخدمه مباشرة
+        if hasattr(validation_outcome, 'raw_llm_output') and validation_outcome.raw_llm_output:
+            return validation_outcome.raw_llm_output
+        # إذا كان هناك validated_output
+        elif hasattr(validation_outcome, 'validated_output') and validation_outcome.validated_output:
+            if hasattr(validation_outcome.validated_output, 'reply'):
+                return validation_outcome.validated_output.reply
+            elif isinstance(validation_outcome.validated_output, dict) and 'reply' in validation_outcome.validated_output:
+                return validation_outcome.validated_output['reply']
+        # إذا فشل التحقق ولكن هناك raw_llm_output
+        elif hasattr(validation_outcome, 'raw_llm_output') and validation_outcome.raw_llm_output:
+            return validation_outcome.raw_llm_output
     except Exception as e:
         logger.error(f"Error extracting reply: {e}")
-        return None
+    return None
 
-# دالة الاتصال بـ DeepSeek مع Guardrails
+# دالة الاتصال بـ DeepSeek مع Guardrails مبسط
 def call_deepseek(history: list) -> str:
     """إرسال تاريخ المحادثة إلى نموذج HF مع تطبيق Guardrails"""
     
@@ -85,98 +91,64 @@ def call_deepseek(history: list) -> str:
         
         # التحقق من حالة الاستجابة
         if response.status_code == 401:
-            return "❌ خطأ في المصادقة. يرجى التحقق من صحة الـ API Token."
+            return " خطأ في المصادقة. يرجى التحقق من صحة الـ API Token."
         elif response.status_code == 429:
-            return "⏳ تم تجاوز الحد المسموح. يرجى الانتظار قليلاً والمحاولة مرة أخرى."
+            return " تم تجاوز الحد المسموح. يرجى الانتظار قليلاً والمحاولة مرة أخرى."
         elif response.status_code == 503:
-            return "🔄 النموذج يحمل الآن. يرجى المحاولة مرة أخرى خلال 30 ثانية."
+            return " النموذج يحمل الآن. يرجى المحاولة مرة أخرى خلال 30 ثانية."
         elif response.status_code != 200:
-            return f"⚠️ خطأ من الخادم: {response.status_code}"
+            return f" خطأ من الخادم: {response.status_code}"
         
         # معالجة الرد الناجح
         result = response.json()
         raw_reply = result["choices"][0]["message"]["content"]
         
-        logger.info(f"✅ تم استلام رد خام: {raw_reply[:100]}...")
+        logger.info(f"تم استلام رد خام: {raw_reply[:100]}...")
         
         # تطبيق Guardrails إذا كان محملاً
         if guard is not None:
             try:
-                logger.info("🛡️ تطبيق Guardrails للتحقق...")
+                logger.info(" تطبيق Guardrails للتحقق...")
                 
-                # محاولات متعددة للتحقق باستخدام Guardrails
-                validated_output = None
+                # الطريقة المبسطة: إنشاء كائن JSON يتوافق مع توقعات الـ rail
+                simple_output = {"reply": raw_reply}
                 
-                # المحاولة الأولى: تحقق مباشر من الرد الخام
-                try:
-                    validated_output = guard.parse(raw_reply)
-                    logger.info("✅ التحقق باستخدام Guardrails نجح (المحاولة الأولى)")
-                except Exception as e1:
-                    logger.warning(f"المحاولة الأولى فشلت: {e1}")
-                    
-                    # المحاولة الثانية: تغليف الرد في كائن JSON
-                    try:
-                        validated_output = guard.parse({"reply": raw_reply})
-                        logger.info("✅ التحقق باستخدام Guardrails نجح (المحاولة الثانية)")
-                    except Exception as e2:
-                        logger.warning(f"المحاولة الثانية فشلت: {e2}")
-                        
-                        # المحاولة الثالثة: استخدام prompt مخصص
-                        try:
-                            last_message = history[-1]["content"] if history else ""
-                            prompt_with_context = f"""
-User Question: {last_message}
-
-Please provide a helpful medical response following these rules:
-- Provide general health information only
-- Do not give personal diagnoses
-- Remind to consult a doctor
-- Use simple plain text
-
-Response to validate: {raw_reply}
-"""
-                            validated_output = guard.parse(prompt_with_context)
-                            logger.info("✅ التحقق باستخدام Guardrails نجح (المحاولة الثالثة)")
-                        except Exception as e3:
-                            logger.error(f"جميع محاولات Guardrails فشلت: {e3}")
-                            validated_output = None
+                # استخدم Guardrails للتحقق
+                validation_result = guard.parse(simple_output)
                 
-                # استخراج الرد النهائي
-                if validated_output is not None:
-                    final_reply = _extract_reply_from_validated(validated_output)
-                    if final_reply:
-                        logger.info(f"🔄 الرد بعد التحقق: {final_reply[:100]}...")
-                        return final_reply
-                    else:
-                        logger.warning("⚠️ Guardrails نجح لكن لم يتم استخراج رد")
-                        return f"{raw_reply}\n\nملاحظة: هذه معلومات عامة - يرجى استشارة طبيب"
+                # استخرج الرد النهائي
+                final_reply = _extract_reply(validation_result)
+                
+                if final_reply:
+                    logger.info(f" الرد بعد التحقق: {final_reply[:100]}...")
+                    return final_reply
                 else:
-                    logger.warning("🛡️ Guardrails فشل في التحقق، استخدام الرد الخام مع تحذير")
-                    return f"{raw_reply}\n\n⚠️ ملاحظة: لم يتم التحقق من هذا الرد طبياً، يرجى استشارة متخصص"
+                    logger.warning(" لم يتم استخراج رد من Guardrails")
+                    return raw_reply
                     
             except Exception as e:
-                logger.error(f"❌ خطأ غير متوقع في Guardrails: {e}")
-                return f"{raw_reply}\n\n⚠️ ملاحظة: حدث خطأ في التحقق، يرجى استشارة طبيب"
+                logger.error(f" خطأ في Guardrails: {e}")
+                # في حالة الخطأ، ارجع الرد الخام مع إضافة تحذير
+                return f"{raw_reply}\n\n ملاحظة: لم يتم تطبيق قواعد التحقق الطبي بسبب خطأ تقني"
         else:
-            # إذا Guardrails غير محمل، ارجع الرد الخام مع تحذير
-            logger.warning("🛡️ Guardrails غير محمل، استخدام الرد الخام")
-            return f"{raw_reply}\n\n⚠️ ملاحظة: لم يتم تطبيق قواعد التحقق الطبي على هذا الرد"
+            # إذا Guardrails غير محمل، ارجع الرد الخام
+            return raw_reply
         
     except requests.exceptions.Timeout:
-        logger.error("⏰ انتهت مهلة الطلب")
-        return "⏰ انتهت المهلة. يرجى المحاولة مرة أخرى."
+        logger.error(" انتهت مهلة الطلب")
+        return " انتهت المهلة. يرجى المحاولة مرة أخرى."
     
     except requests.exceptions.ConnectionError:
-        logger.error("🔌 خطأ في الاتصال")
-        return "🔌 خطأ في الاتصال بالخادم. يرجى التحقق من الإنترنت."
+        logger.error(" خطأ في الاتصال")
+        return " خطأ في الاتصال بالخادم. يرجى التحقق من الإنترنت."
     
     except KeyError as e:
-        logger.error(f"📋 هيكل غير متوقع للرد: {e}")
-        return "📋 عذراً، هناك مشكلة في تنسيق الرد من النموذج."
+        logger.error(f" هيكل غير متوقع للرد: {e}")
+        return " عذراً، هناك مشكلة في تنسيق الرد من النموذج."
     
     except Exception as e:
-        logger.exception(f"❌ خطأ غير متوقع: {e}")
-        return "❌ عذراً، حدث خطأ غير متوقع. يرجى المحاولة لاحقاً."
+        logger.exception(f" خطأ غير متوقع: {e}")
+        return "عذراً، حدث خطأ غير متوقع. يرجى المحاولة لاحقاً."
 
 # endpoint الجذر
 @app.get("/")
@@ -207,16 +179,16 @@ async def chat(request: ChatRequest):
         history = request.conversation_history.copy()
         history.append({"role": "user", "content": request.message})
         
-        logger.info(f"📨 رسالة المستخدم: {request.message}")
+        logger.info(f"رسالة المستخدم: {request.message}")
         
         # استدعاء النموذج
         reply = call_deepseek(history)
         
-        logger.info("✅ تمت معالجة الطلب بنجاح")
+        logger.info(" تمت معالجة الطلب بنجاح")
         return ChatResponse(reply=reply, status="success")
         
     except Exception as e:
-        logger.error(f"❌ خطأ في endpoint الدردشة: {e}")
+        logger.error(f" خطأ في endpoint الدردشة: {e}")
         raise HTTPException(
             status_code=500, 
             detail="Internal server error"
