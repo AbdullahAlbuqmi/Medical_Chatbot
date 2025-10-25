@@ -5,7 +5,6 @@ import logging
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
-from guardrails.hub import NSFWText, ToxicLanguage
 from guardrails import Guard
 
 # إعداد logging
@@ -35,7 +34,6 @@ HEADERS = {
 
 # تعريف Guardrails
 try:
-    # الطريقة الأولى: استخدام rail specification كسلسلة نصية
     rail_spec = """
 <rail version="0.1">
 <output>
@@ -93,7 +91,6 @@ def call_deepseek(history: list) -> str:
             headers=HEADERS,
             json={
                 "messages": history, 
-                "model": "deepseek-ai/DeepSeek-V3.2-Exp",
                 "max_tokens": 500,
                 "temperature": 0.7
             },
@@ -118,7 +115,7 @@ def call_deepseek(history: list) -> str:
 
     # 4) استخراج الرد الخام
     try:
-        raw_reply = result["choices"][0]["message"]["content"]
+        raw_reply = result[0]["generated_text"]
     except Exception as e:
         logger.error(f"Unexpected HF result structure: {result}, error: {e}")
         return "عذراً، النموذج أعاد تنسيق نتيجة غير متوقع."
