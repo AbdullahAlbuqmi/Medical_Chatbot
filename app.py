@@ -4,6 +4,7 @@ import logging
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
+from guardrails import Guard
 
 # إعداد logging
 logging.basicConfig(level=logging.INFO)
@@ -30,6 +31,14 @@ headers = {
     "Content-Type": "application/json"
 }
 
+# تحميل Guardrails من ملف medical_guard.rail
+try:
+    guard = Guard.from_rail("medical_guard.rail")
+    logger.info("✅ Guardrails loaded successfully from medical_guard.rail")
+except Exception as e:
+    logger.error(f"❌ Failed to load Guardrails: {e}")
+    guard = None
+
 # نموذج البيانات
 class ChatRequest(BaseModel):
     message: str
@@ -39,9 +48,23 @@ class ChatResponse(BaseModel):
     reply: str
     status: str
 
-# دالة الاتصال بـ DeepSeek - مبسطة وبدون تعقيد
+# دالة مساعدة لاستخراج الرد من Guardrails output
+def _extract_reply_from_validated(validated_output):
+    """استخراج الرد من المخرجات المصدق عليها"""
+    try:
+        if isinstance(validated_output, dict) and "reply" in validated_output:
+            return validated_output["reply"]
+        elif hasattr(validated_output, "reply"):
+            return validated_output.reply
+        else:
+            return str(validated_output)
+    except Exception as e:
+        logger.error(f"Error extracting reply: {e}")
+        return None
+
+# دالة الاتصال بـ DeepSeek مع Guardrails
 def call_deepseek(history: list) -> str:
-    """إرسال تاريخ المحادثة إلى نموذج HF والحصول على الرد"""
+    """إرسال تاريخ المحادثة إلى نموذج HF مع تطبيق Guardrails"""
     
     try:
         payload = {
@@ -74,8 +97,70 @@ def call_deepseek(history: list) -> str:
         result = response.json()
         raw_reply = result["choices"][0]["message"]["content"]
         
-        logger.info(f"✅ تم استلام رد بنجاح: {raw_reply[:100]}...")
-        return raw_reply
+        logger.info(f"✅ تم استلام رد خام: {raw_reply[:100]}...")
+        
+        # تطبيق Guardrails إذا كان محملاً
+        if guard is not None:
+            try:
+                logger.info("🛡️ تطبيق Guardrails للتحقق...")
+                
+                # محاولات متعددة للتحقق باستخدام Guardrails
+                validated_output = None
+                
+                # المحاولة الأولى: تحقق مباشر من الرد الخام
+                try:
+                    validated_output = guard.parse(raw_reply)
+                    logger.info("✅ التحقق باستخدام Guardrails نجح (المحاولة الأولى)")
+                except Exception as e1:
+                    logger.warning(f"المحاولة الأولى فشلت: {e1}")
+                    
+                    # المحاولة الثانية: تغليف الرد في كائن JSON
+                    try:
+                        validated_output = guard.parse({"reply": raw_reply})
+                        logger.info("✅ التحقق باستخدام Guardrails نجح (المحاولة الثانية)")
+                    except Exception as e2:
+                        logger.warning(f"المحاولة الثانية فشلت: {e2}")
+                        
+                        # المحاولة الثالثة: استخدام prompt مخصص
+                        try:
+                            last_message = history[-1]["content"] if history else ""
+                            prompt_with_context = f"""
+User Question: {last_message}
+
+Please provide a helpful medical response following these rules:
+- Provide general health information only
+- Do not give personal diagnoses
+- Remind to consult a doctor
+- Use simple plain text
+
+Response to validate: {raw_reply}
+"""
+                            validated_output = guard.parse(prompt_with_context)
+                            logger.info("✅ التحقق باستخدام Guardrails نجح (المحاولة الثالثة)")
+                        except Exception as e3:
+                            logger.error(f"جميع محاولات Guardrails فشلت: {e3}")
+                            validated_output = None
+                
+                # استخراج الرد النهائي
+                if validated_output is not None:
+                    final_reply = _extract_reply_from_validated(validated_output)
+                    if final_reply:
+                        logger.info(f"🔄 الرد بعد التحقق: {final_reply[:100]}...")
+                        return final_reply
+                    else:
+                        logger.warning("⚠️ Guardrails نجح لكن لم يتم استخراج رد")
+                        return f"{raw_reply}\n\nملاحظة: هذه معلومات عامة - يرجى استشارة طبيب"
+                else:
+                    logger.warning("🛡️ Guardrails فشل في التحقق، استخدام الرد الخام مع تحذير")
+                    return f"{raw_reply}\n\n⚠️ ملاحظة: لم يتم التحقق من هذا الرد طبياً، يرجى استشارة متخصص"
+                    
+            except Exception as e:
+                logger.error(f"❌ خطأ غير متوقع في Guardrails: {e}")
+                return f"{raw_reply}\n\n⚠️ ملاحظة: حدث خطأ في التحقق، يرجى استشارة طبيب"
+        else:
+            # إذا Guardrails غير محمل، ارجع الرد الخام مع تحذير
+            logger.warning("🛡️ Guardrails غير محمل، استخدام الرد الخام")
+            return f"{raw_reply}\n\n⚠️ ملاحظة: لم يتم تطبيق قواعد التحقق الطبي على هذا الرد"
         
     except requests.exceptions.Timeout:
         logger.error("⏰ انتهت مهلة الطلب")
@@ -96,16 +181,23 @@ def call_deepseek(history: list) -> str:
 # endpoint الجذر
 @app.get("/")
 async def root():
+    guard_status = "active" if guard is not None else "inactive"
     return {
         "message": "Medical Chatbot API - DeepSeek Assistant", 
         "status": "active",
-        "version": "1.0.0"
+        "version": "1.0.0",
+        "guardrails": guard_status
     }
 
 # endpoint الحالة
 @app.get("/health")
 async def health_check():
-    return {"status": "healthy", "service": "medical_chatbot"}
+    guard_status = "loaded" if guard is not None else "not_loaded"
+    return {
+        "status": "healthy", 
+        "service": "medical_chatbot",
+        "guardrails": guard_status
+    }
 
 # endpoint الدردشة الرئيسي
 @app.post("/chat", response_model=ChatResponse)
