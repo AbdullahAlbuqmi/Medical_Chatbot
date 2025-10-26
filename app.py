@@ -2,6 +2,7 @@ import os
 import requests
 import logging
 import json
+import asyncio
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
@@ -10,6 +11,9 @@ from guardrails import Guard
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
+
+# Suppress Guardrails warnings
+logging.getLogger("guardrails-ai").setLevel(logging.ERROR)
 
 # Initialize FastAPI
 app = FastAPI(title="Medical Chatbot API", version="1.0.0")
@@ -33,12 +37,13 @@ headers = {
 }
 
 # Load Guardrails from medical_guard.rail file
+guard = None
 try:
     guard = Guard.from_rail("medical_guard.rail")
     logger.info("Guardrails loaded successfully from medical_guard.rail")
 except Exception as e:
     logger.error(f"Failed to load Guardrails: {e}")
-    guard = None
+    logger.info("Continuing without Guardrails validation")
 
 # Data models
 class ChatRequest(BaseModel):
@@ -48,6 +53,55 @@ class ChatRequest(BaseModel):
 class ChatResponse(BaseModel):
     reply: str
     status: str
+
+def validate_with_guardrails(raw_reply: str) -> str:
+    """Validate reply using Guardrails with proper error handling"""
+    if guard is None:
+        return clean_medical_response(raw_reply)
+    
+    try:
+        # Create the structured output
+        llm_output = {
+            "reply": raw_reply
+        }
+        
+        # Convert to JSON string
+        llm_output_str = json.dumps(llm_output)
+        
+        logger.info("Validating with Guardrails...")
+        
+        # Use guard.parse with proper parameters
+        validation_result = guard.parse(
+            llm_output=llm_output_str,
+            num_reasks=1
+        )
+        
+        # Check validation result
+        if validation_result.validation_passed:
+            validated_data = validation_result.validated_output
+            if isinstance(validated_data, dict) and 'reply' in validated_data:
+                final_reply = validated_data['reply']
+            elif isinstance(validated_data, str):
+                # Sometimes Guardrails returns a JSON string
+                try:
+                    parsed = json.loads(validated_data)
+                    final_reply = parsed.get('reply', validated_data)
+                except:
+                    final_reply = validated_data
+            else:
+                final_reply = str(validated_data)
+            
+            logger.info("Guardrails validation passed")
+            return final_reply
+        else:
+            logger.warning(f"Validation failed: {validation_result.error}")
+            # Fall back to cleaned response
+            return clean_medical_response(raw_reply)
+            
+    except Exception as e:
+        logger.error(f"Error in Guardrails validation: {str(e)}")
+        # Fall back to cleaned response
+        return clean_medical_response(raw_reply)
 
 # Improved function to call DeepSeek with Guardrails
 def call_deepseek(history: list) -> str:
@@ -87,59 +141,11 @@ def call_deepseek(history: list) -> str:
         
         logger.info(f"Received raw reply: {raw_reply[:100]}...")
         
-        # Apply Guardrails if loaded
-        if guard is not None:
-            try:
-                logger.info("Applying Guardrails validation...")
-                
-                # Wrap the raw reply in the expected structure
-                llm_output = f'{{"reply": "{escape_json_string(raw_reply)}"}}'
-                
-                # Use guard.parse() with the JSON string
-                validation_result = guard.parse(
-                    llm_output=llm_output,
-                    num_reasks=2  # Allow up to 2 reasks if validation fails
-                )
-                
-                # Check if validation passed
-                if validation_result.validation_passed:
-                    # Extract the validated reply
-                    validated_data = validation_result.validated_output
-                    if isinstance(validated_data, dict) and 'reply' in validated_data:
-                        final_reply = validated_data['reply']
-                    else:
-                        final_reply = str(validated_data)
-                    
-                    logger.info(f"Reply after validation: {final_reply[:100]}...")
-                    return final_reply
-                else:
-                    # Validation failed - clean and retry
-                    logger.warning(f"Validation failed: {validation_result.error}")
-                    cleaned_reply = clean_medical_response(raw_reply)
-                    
-                    # Try again with cleaned reply
-                    llm_output = f'{{"reply": "{escape_json_string(cleaned_reply)}"}}'
-                    validation_result = guard.parse(llm_output=llm_output, num_reasks=0)
-                    
-                    if validation_result.validation_passed:
-                        validated_data = validation_result.validated_output
-                        if isinstance(validated_data, dict) and 'reply' in validated_data:
-                            final_reply = validated_data['reply']
-                        else:
-                            final_reply = str(validated_data)
-                        logger.info(f"Reply after cleaning: {final_reply[:100]}...")
-                        return final_reply
-                    else:
-                        logger.warning("Cleaned reply still failed validation, using raw reply")
-                        return f"{raw_reply}\n\nNote: Please consult a healthcare professional for medical advice."
-                    
-            except Exception as e:
-                logger.error(f"Error in Guardrails processing: {e}")
-                logger.exception(e)
-                return clean_medical_response(raw_reply)
-        else:
-            # If Guardrails not loaded, return cleaned reply
-            return clean_medical_response(raw_reply)
+        # Apply Guardrails validation
+        final_reply = validate_with_guardrails(raw_reply)
+        
+        logger.info("Request processed successfully")
+        return final_reply
         
     except requests.exceptions.Timeout:
         logger.error("Request timeout")
@@ -157,19 +163,6 @@ def call_deepseek(history: list) -> str:
         logger.exception(f"Unexpected error: {e}")
         return "Sorry, an unexpected error occurred. Please try again later."
 
-def escape_json_string(text: str) -> str:
-    """Escape special characters for JSON string"""
-    # Replace backslashes first
-    text = text.replace('\\', '\\\\')
-    # Replace quotes
-    text = text.replace('"', '\\"')
-    # Replace newlines
-    text = text.replace('\n', '\\n')
-    text = text.replace('\r', '\\r')
-    # Replace tabs
-    text = text.replace('\t', '\\t')
-    return text
-
 def clean_medical_response(text: str) -> str:
     """Clean and format medical response to pass Guardrails validation"""
     
@@ -186,6 +179,9 @@ def clean_medical_response(text: str) -> str:
         except:
             pass
     
+    # Remove code block markers
+    text = text.replace('```', '').strip()
+    
     # Ensure the response is within length limits (10-2000 chars)
     if len(text) < 10:
         text = "I understand your health concern. " + text
@@ -196,7 +192,8 @@ def clean_medical_response(text: str) -> str:
     # Add medical disclaimer if not present
     disclaimer_phrases = [
         "consult a doctor", "consult with a healthcare professional", 
-        "talk to your doctor", "seek medical advice", "healthcare provider"
+        "talk to your doctor", "seek medical advice", "healthcare provider",
+        "medical professional"
     ]
     
     has_disclaimer = any(phrase in text.lower() for phrase in disclaimer_phrases)
