@@ -6,14 +6,14 @@ from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from guardrails import Guard
 
-# إعداد logging
+# Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
-# تهيئة FastAPI
+# Initialize FastAPI
 app = FastAPI(title="Medical Chatbot API", version="1.0.0")
 
-# CORS
+# CORS middleware
 app.add_middleware(
     CORSMiddleware,
     allow_origins=["*"],
@@ -22,7 +22,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-# إعداد المتغيرات البيئية
+# Environment variables
 API_URL = "https://router.huggingface.co/v1/chat/completions"
 HF_TOKEN = os.getenv("HF_TOKEN", "your_token_here")
 
@@ -31,15 +31,15 @@ headers = {
     "Content-Type": "application/json"
 }
 
-# تحميل Guardrails من ملف medical_guard.rail
+# Load Guardrails from medical_guard.rail file
 try:
     guard = Guard.from_rail("medical_guard.rail")
-    logger.info(" Guardrails loaded successfully from medical_guard.rail")
+    logger.info("Guardrails loaded successfully from medical_guard.rail")
 except Exception as e:
-    logger.error(f" Failed to load Guardrails: {e}")
+    logger.error(f"Failed to load Guardrails: {e}")
     guard = None
 
-# نموذج البيانات
+# Data models
 class ChatRequest(BaseModel):
     message: str
     conversation_history: list = []
@@ -48,29 +48,9 @@ class ChatResponse(BaseModel):
     reply: str
     status: str
 
-# دالة مبسطة لاستخراج الرد من Guardrails
-def _extract_reply(validation_outcome):
-    """استخراج الرد من نتيجة التحقق بشكل مبسط"""
-    try:
-        # إذا كان هناك raw_llm_output، استخدمه مباشرة
-        if hasattr(validation_outcome, 'raw_llm_output') and validation_outcome.raw_llm_output:
-            return validation_outcome.raw_llm_output
-        # إذا كان هناك validated_output
-        elif hasattr(validation_outcome, 'validated_output') and validation_outcome.validated_output:
-            if hasattr(validation_outcome.validated_output, 'reply'):
-                return validation_outcome.validated_output.reply
-            elif isinstance(validation_outcome.validated_output, dict) and 'reply' in validation_outcome.validated_output:
-                return validation_outcome.validated_output['reply']
-        # إذا فشل التحقق ولكن هناك raw_llm_output
-        elif hasattr(validation_outcome, 'raw_llm_output') and validation_outcome.raw_llm_output:
-            return validation_outcome.raw_llm_output
-    except Exception as e:
-        logger.error(f"Error extracting reply: {e}")
-    return None
-
-# دالة الاتصال بـ DeepSeek مع Guardrails مبسط
+# Fixed function to call DeepSeek with Guardrails
 def call_deepseek(history: list) -> str:
-    """إرسال تاريخ المحادثة إلى نموذج HF مع تطبيق Guardrails"""
+    """Send conversation history to HF model with Guardrails application"""
     
     try:
         payload = {
@@ -80,7 +60,7 @@ def call_deepseek(history: list) -> str:
             "temperature": 0.7
         }
         
-        logger.info(f"إرسال طلب إلى HuggingFace API...")
+        logger.info(f"Sending request to HuggingFace API...")
         
         response = requests.post(
             API_URL, 
@@ -89,68 +69,71 @@ def call_deepseek(history: list) -> str:
             timeout=30
         )
         
-        # التحقق من حالة الاستجابة
+        # Check response status
         if response.status_code == 401:
-            return " خطأ في المصادقة. يرجى التحقق من صحة الـ API Token."
+            return "Authentication error. Please check your API Token."
         elif response.status_code == 429:
-            return " تم تجاوز الحد المسموح. يرجى الانتظار قليلاً والمحاولة مرة أخرى."
+            return "Rate limit exceeded. Please wait a moment and try again."
         elif response.status_code == 503:
-            return " النموذج يحمل الآن. يرجى المحاولة مرة أخرى خلال 30 ثانية."
+            return "Model is currently loading. Please try again in 30 seconds."
         elif response.status_code != 200:
-            return f" خطأ من الخادم: {response.status_code}"
+            return f"Server error: {response.status_code}"
         
-        # معالجة الرد الناجح
+        # Process successful response
         result = response.json()
         raw_reply = result["choices"][0]["message"]["content"]
         
-        logger.info(f"تم استلام رد خام: {raw_reply[:100]}...")
+        logger.info(f"Received raw reply: {raw_reply[:100]}...")
         
-        # تطبيق Guardrails إذا كان محملاً
+        # Apply Guardrails if loaded
         if guard is not None:
             try:
-                logger.info(" تطبيق Guardrails للتحقق...")
+                logger.info("Applying Guardrails validation...")
                 
-                # الطريقة المبسطة: إنشاء كائن JSON يتوافق مع توقعات الـ rail
-                simple_output = {"reply": raw_reply}
+                # Correct way: pass raw text to Guardrails for parsing
+                validation_result = guard.parse(raw_reply)
                 
-                # استخدم Guardrails للتحقق
-                validation_result = guard.parse(simple_output)
-                
-                # استخرج الرد النهائي
-                final_reply = _extract_reply(validation_result)
-                
-                if final_reply:
-                    logger.info(f" الرد بعد التحقق: {final_reply[:100]}...")
+                # Extract final reply
+                if hasattr(validation_result, 'validated_output') and validation_result.validated_output:
+                    if hasattr(validation_result.validated_output, 'reply'):
+                        final_reply = validation_result.validated_output.reply
+                    elif isinstance(validation_result.validated_output, dict) and 'reply' in validation_result.validated_output:
+                        final_reply = validation_result.validated_output['reply']
+                    else:
+                        final_reply = str(validation_result.validated_output)
+                    
+                    logger.info(f"Reply after validation: {final_reply[:100]}...")
                     return final_reply
                 else:
-                    logger.warning(" لم يتم استخراج رد من Guardrails")
-                    return raw_reply
+                    # If validation fails, use raw reply with warning
+                    logger.warning("Guardrails validation failed, using raw reply")
+                    return f"{raw_reply}\n\nNote: This response was not validated according to medical rules"
                     
             except Exception as e:
-                logger.error(f" خطأ في Guardrails: {e}")
-                # في حالة الخطأ، ارجع الرد الخام مع إضافة تحذير
-                return f"{raw_reply}\n\n ملاحظة: لم يتم تطبيق قواعد التحقق الطبي بسبب خطأ تقني"
+                logger.error(f"Error in Guardrails: {e}")
+                # In case of error, return raw reply
+                return raw_reply
         else:
-            # إذا Guardrails غير محمل، ارجع الرد الخام
+            # If Guardrails not loaded, return raw reply
             return raw_reply
         
     except requests.exceptions.Timeout:
-        logger.error(" انتهت مهلة الطلب")
-        return " انتهت المهلة. يرجى المحاولة مرة أخرى."
+        logger.error("Request timeout")
+        return "Request timeout. Please try again."
     
     except requests.exceptions.ConnectionError:
-        logger.error(" خطأ في الاتصال")
-        return " خطأ في الاتصال بالخادم. يرجى التحقق من الإنترنت."
+        logger.error("Connection error")
+        return "Connection error with server. Please check your internet."
     
     except KeyError as e:
-        logger.error(f" هيكل غير متوقع للرد: {e}")
-        return " عذراً، هناك مشكلة في تنسيق الرد من النموذج."
+        logger.error(f"Unexpected response structure: {e}")
+        return "Sorry, there's an issue with the response format from the model."
     
     except Exception as e:
-        logger.exception(f" خطأ غير متوقع: {e}")
-        return "عذراً، حدث خطأ غير متوقع. يرجى المحاولة لاحقاً."
+        logger.exception(f"Unexpected error: {e}")
+        return "Sorry, an unexpected error occurred. Please try again later."
 
-# endpoint الجذر
+# Root endpoint
 @app.get("/")
 async def root():
     guard_status = "active" if guard is not None else "inactive"
@@ -161,7 +144,7 @@ async def root():
         "guardrails": guard_status
     }
 
-# endpoint الحالة
+# Health endpoint
 @app.get("/health")
 async def health_check():
     guard_status = "loaded" if guard is not None else "not_loaded"
@@ -171,30 +154,30 @@ async def health_check():
         "guardrails": guard_status
     }
 
-# endpoint الدردشة الرئيسي
+# Main chat endpoint
 @app.post("/chat", response_model=ChatResponse)
 async def chat(request: ChatRequest):
     try:
-        # بناء تاريخ المحادثة
+        # Build conversation history
         history = request.conversation_history.copy()
         history.append({"role": "user", "content": request.message})
         
-        logger.info(f"رسالة المستخدم: {request.message}")
+        logger.info(f"User message: {request.message}")
         
-        # استدعاء النموذج
+        # Call the model
         reply = call_deepseek(history)
         
-        logger.info(" تمت معالجة الطلب بنجاح")
+        logger.info("Request processed successfully")
         return ChatResponse(reply=reply, status="success")
         
     except Exception as e:
-        logger.error(f" خطأ في endpoint الدردشة: {e}")
+        logger.error(f"Error in chat endpoint: {e}")
         raise HTTPException(
             status_code=500, 
             detail="Internal server error"
         )
 
-# تشغيل الخادم
+# Run server
 if __name__ == "__main__":
     import uvicorn
     uvicorn.run(app, host="0.0.0.0", port=8000)
