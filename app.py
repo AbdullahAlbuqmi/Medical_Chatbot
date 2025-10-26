@@ -6,7 +6,6 @@ from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from guardrails import Guard
-from guardrails.hub import ValidLength
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
