@@ -92,53 +92,54 @@ def call_deepseek(history: list) -> str:
             try:
                 logger.info("Applying Guardrails validation...")
                 
-                # Method 1: Try direct parsing first
-                try:
-                    validation_result = guard.parse(raw_reply)
+                # Wrap the raw reply in the expected structure
+                llm_output = f'{{"reply": "{escape_json_string(raw_reply)}"}}'
+                
+                # Use guard.parse() with the JSON string
+                validation_result = guard.parse(
+                    llm_output=llm_output,
+                    num_reasks=2  # Allow up to 2 reasks if validation fails
+                )
+                
+                # Check if validation passed
+                if validation_result.validation_passed:
+                    # Extract the validated reply
+                    validated_data = validation_result.validated_output
+                    if isinstance(validated_data, dict) and 'reply' in validated_data:
+                        final_reply = validated_data['reply']
+                    else:
+                        final_reply = str(validated_data)
+                    
+                    logger.info(f"Reply after validation: {final_reply[:100]}...")
+                    return final_reply
+                else:
+                    # Validation failed - clean and retry
+                    logger.warning(f"Validation failed: {validation_result.error}")
+                    cleaned_reply = clean_medical_response(raw_reply)
+                    
+                    # Try again with cleaned reply
+                    llm_output = f'{{"reply": "{escape_json_string(cleaned_reply)}"}}'
+                    validation_result = guard.parse(llm_output=llm_output, num_reasks=0)
                     
                     if validation_result.validation_passed:
-                        final_reply = validation_result.validated_output.get('reply', raw_reply)
-                        logger.info(f"Reply after validation: {final_reply[:100]}...")
-                        return final_reply
-                    else:
-                        logger.warning("Direct parsing failed, trying structured approach")
-                        raise ValueError("Direct parsing failed")
-                        
-                except Exception as e:
-                    logger.warning(f"Direct parsing failed: {e}, trying structured approach")
-                    
-                    # Method 2: Create structured output for Guardrails
-                    structured_output = {"reply": raw_reply}
-                    
-                    # Validate the structured output
-                    validation_result = guard.validate(structured_output)
-                    
-                    if validation_result.validation_passed:
-                        final_reply = validation_result.validated_output.get('reply', raw_reply)
-                        logger.info(f"Reply after structured validation: {final_reply[:100]}...")
-                        return final_reply
-                    else:
-                        # If validation fails, check why and try to fix
-                        logger.warning(f"Validation errors: {validation_result.error}")
-                        
-                        # Method 3: Manual validation and cleaning
-                        cleaned_reply = clean_medical_response(raw_reply)
-                        validation_result = guard.validate({"reply": cleaned_reply})
-                        
-                        if validation_result.validation_passed:
-                            final_reply = validation_result.validated_output.get('reply', cleaned_reply)
-                            logger.info(f"Reply after cleaning: {final_reply[:100]}...")
-                            return final_reply
+                        validated_data = validation_result.validated_output
+                        if isinstance(validated_data, dict) and 'reply' in validated_data:
+                            final_reply = validated_data['reply']
                         else:
-                            logger.warning("All validation methods failed, using raw reply with warning")
-                            return f"{raw_reply}\n\nNote: This response was not validated according to medical safety rules."
+                            final_reply = str(validated_data)
+                        logger.info(f"Reply after cleaning: {final_reply[:100]}...")
+                        return final_reply
+                    else:
+                        logger.warning("Cleaned reply still failed validation, using raw reply")
+                        return f"{raw_reply}\n\nNote: Please consult a healthcare professional for medical advice."
                     
             except Exception as e:
                 logger.error(f"Error in Guardrails processing: {e}")
-                return raw_reply
+                logger.exception(e)
+                return clean_medical_response(raw_reply)
         else:
-            # If Guardrails not loaded, return raw reply
-            return raw_reply
+            # If Guardrails not loaded, return cleaned reply
+            return clean_medical_response(raw_reply)
         
     except requests.exceptions.Timeout:
         logger.error("Request timeout")
@@ -156,13 +157,36 @@ def call_deepseek(history: list) -> str:
         logger.exception(f"Unexpected error: {e}")
         return "Sorry, an unexpected error occurred. Please try again later."
 
+def escape_json_string(text: str) -> str:
+    """Escape special characters for JSON string"""
+    # Replace backslashes first
+    text = text.replace('\\', '\\\\')
+    # Replace quotes
+    text = text.replace('"', '\\"')
+    # Replace newlines
+    text = text.replace('\n', '\\n')
+    text = text.replace('\r', '\\r')
+    # Replace tabs
+    text = text.replace('\t', '\\t')
+    return text
+
 def clean_medical_response(text: str) -> str:
     """Clean and format medical response to pass Guardrails validation"""
     
     # Remove any markdown formatting
     text = text.replace('**', '').replace('*', '').replace('`', '')
+    text = text.replace('#', '').strip()
     
-    # Ensure the response is within length limits
+    # Remove JSON or code blocks
+    if text.startswith('{') and text.endswith('}'):
+        try:
+            data = json.loads(text)
+            if 'reply' in data:
+                text = data['reply']
+        except:
+            pass
+    
+    # Ensure the response is within length limits (10-2000 chars)
     if len(text) < 10:
         text = "I understand your health concern. " + text
     
@@ -172,7 +196,7 @@ def clean_medical_response(text: str) -> str:
     # Add medical disclaimer if not present
     disclaimer_phrases = [
         "consult a doctor", "consult with a healthcare professional", 
-        "talk to your doctor", "seek medical advice"
+        "talk to your doctor", "seek medical advice", "healthcare provider"
     ]
     
     has_disclaimer = any(phrase in text.lower() for phrase in disclaimer_phrases)

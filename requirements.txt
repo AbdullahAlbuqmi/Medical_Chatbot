@@ -1,6 +1,6 @@
 fastapi
-uvicorn[standard]
-requests
+uvicorn
 pydantic
+requests
 guardrails-ai
-aiohttp
+python-multipart
