@@ -2,17 +2,19 @@ import os
 import requests
 import logging
 import json
-import asyncio
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
 from guardrails import Guard
+from guardrails.hub import ValidLength
 
 # Setup logging
 logging.basicConfig(level=logging.INFO)
 logger = logging.getLogger(__name__)
 
 # Suppress Guardrails warnings
+import warnings
+warnings.filterwarnings("ignore", message="Could not obtain an event loop")
 logging.getLogger("guardrails-ai").setLevel(logging.ERROR)
 
 # Initialize FastAPI
@@ -36,14 +38,50 @@ headers = {
     "Content-Type": "application/json"
 }
 
-# Load Guardrails from medical_guard.rail file
+# Create Guardrails programmatically with validators
 guard = None
 try:
+    # Try to load from RAIL file first
     guard = Guard.from_rail("medical_guard.rail")
     logger.info("Guardrails loaded successfully from medical_guard.rail")
 except Exception as e:
-    logger.error(f"Failed to load Guardrails: {e}")
-    logger.info("Continuing without Guardrails validation")
+    logger.warning(f"Could not load RAIL file: {e}")
+    try:
+        # Fallback: Create guard programmatically
+        from guardrails import Guard
+        from pydantic import BaseModel, Field
+        
+        class MedicalResponse(BaseModel):
+            reply: str = Field(
+                description="AI medical assistant's response",
+                min_length=10,
+                max_length=2000
+            )
+        
+        guard = Guard.from_pydantic(
+            output_class=MedicalResponse,
+            prompt="""You are a medical AI assistant. You MUST follow these rules strictly:
+
+CRITICAL: If the user's question is NOT about health, medical topics, wellness, symptoms, or healthcare, you MUST respond with EXACTLY this text:
+"I can only help with general health questions. Please consult a healthcare professional for medical advice."
+
+For health-related questions:
+1. Provide general health information and education only
+2. Do not give personal medical diagnoses or specific treatment advice
+3. Do not prescribe medications or suggest specific dosages
+4. Always include a reminder to consult with healthcare professionals
+5. Use simple, clear language (50-300 words)
+6. Never use markdown, JSON, or code formatting - plain text only
+7. Be empathetic, supportive, and non-judgmental
+
+User question: {{user_input}}
+
+Your response:"""
+        )
+        logger.info("Guardrails created programmatically")
+    except Exception as e2:
+        logger.error(f"Failed to create Guardrails: {e2}")
+        guard = None
 
 # Data models
 class ChatRequest(BaseModel):
@@ -54,69 +92,66 @@ class ChatResponse(BaseModel):
     reply: str
     status: str
 
-def validate_with_guardrails(raw_reply: str) -> str:
-    """Validate reply using Guardrails with proper error handling"""
-    if guard is None:
-        return clean_medical_response(raw_reply)
+def call_deepseek_with_guard(user_message: str, history: list) -> str:
+    """Call DeepSeek using Guardrails __call__ method for proper prompt injection"""
     
     try:
-        # Create the structured output
-        llm_output = {
-            "reply": raw_reply
-        }
+        if guard is None:
+            # Fallback if guard not loaded
+            return call_deepseek_direct(user_message, history)
         
-        # Convert to JSON string
-        llm_output_str = json.dumps(llm_output)
+        logger.info("Using Guardrails to generate and validate response...")
         
-        logger.info("Validating with Guardrails...")
-        
-        # Use guard.parse with proper parameters
-        validation_result = guard.parse(
-            llm_output=llm_output_str,
-            num_reasks=1
+        # Use Guardrails __call__ method which handles prompt injection and validation
+        result = guard(
+            llm_api=lambda prompt: call_llm_with_prompt(prompt, history),
+            prompt_params={"user_input": user_message},
+            num_reasks=2,
+            max_tokens=500,
+            temperature=0.7
         )
         
-        # Check validation result
-        if validation_result.validation_passed:
-            validated_data = validation_result.validated_output
-            if isinstance(validated_data, dict) and 'reply' in validated_data:
-                final_reply = validated_data['reply']
-            elif isinstance(validated_data, str):
-                # Sometimes Guardrails returns a JSON string
-                try:
-                    parsed = json.loads(validated_data)
-                    final_reply = parsed.get('reply', validated_data)
-                except:
-                    final_reply = validated_data
+        # Extract validated output
+        if result.validated_output:
+            if isinstance(result.validated_output, dict):
+                reply = result.validated_output.get('reply', str(result.validated_output))
             else:
-                final_reply = str(validated_data)
+                reply = str(result.validated_output)
             
-            logger.info("Guardrails validation passed")
-            return final_reply
+            logger.info(f"Guardrails validated response: {reply[:100]}...")
+            return clean_medical_response(reply)
         else:
-            logger.warning(f"Validation failed: {validation_result.error}")
-            # Fall back to cleaned response
-            return clean_medical_response(raw_reply)
+            logger.warning("No validated output, using raw output")
+            return clean_medical_response(str(result.raw_llm_output))
             
     except Exception as e:
-        logger.error(f"Error in Guardrails validation: {str(e)}")
-        # Fall back to cleaned response
-        return clean_medical_response(raw_reply)
+        logger.error(f"Error in Guardrails processing: {e}")
+        logger.exception(e)
+        # Fallback to direct call
+        return call_deepseek_direct(user_message, history)
 
-# Improved function to call DeepSeek with Guardrails
-def call_deepseek(history: list) -> str:
-    """Send conversation history to HF model with Guardrails application"""
+def call_llm_with_prompt(prompt: str, history: list) -> str:
+    """Call the LLM with a specific prompt (used by Guardrails)"""
     
     try:
-        # Prepare the payload
+        # Guardrails injects the full prompt, so we use it directly
+        messages = [
+            {"role": "system", "content": "You are a helpful medical AI assistant."}
+        ]
+        
+        # Add conversation history if available
+        if history:
+            messages.extend(history[:-1])  # Exclude the last user message as it's in the prompt
+        
+        # Add the Guardrails-generated prompt as the user message
+        messages.append({"role": "user", "content": prompt})
+        
         payload = {
-            "messages": history,
+            "messages": messages,
             "model": "deepseek-ai/DeepSeek-V3.2-Exp:novita",
             "max_tokens": 500,
             "temperature": 0.7
         }
-        
-        logger.info("Sending request to HuggingFace API...")
         
         response = requests.post(
             API_URL, 
@@ -125,7 +160,53 @@ def call_deepseek(history: list) -> str:
             timeout=30
         )
         
-        # Check response status
+        if response.status_code != 200:
+            raise Exception(f"API error: {response.status_code}")
+        
+        result = response.json()
+        return result["choices"][0]["message"]["content"]
+        
+    except Exception as e:
+        logger.error(f"Error calling LLM: {e}")
+        raise
+
+def call_deepseek_direct(user_message: str, history: list) -> str:
+    """Direct call to DeepSeek without Guardrails (fallback)"""
+    
+    try:
+        # Add system message with strict instructions
+        messages = [{
+            "role": "system",
+            "content": """You are a medical AI assistant. CRITICAL RULES:
+
+If the question is NOT about health/medical topics, respond EXACTLY: "I can only help with general health questions. Please consult a healthcare professional for medical advice."
+
+For health questions:
+1. Provide general health information only
+2. Do NOT diagnose or prescribe
+3. ALWAYS include reminder to consult healthcare professionals
+4. Use plain text, 50-300 words
+5. Be empathetic and supportive"""
+        }]
+        
+        messages.extend(history)
+        
+        payload = {
+            "messages": messages,
+            "model": "deepseek-ai/DeepSeek-V3.2-Exp:novita",
+            "max_tokens": 500,
+            "temperature": 0.7
+        }
+        
+        logger.info("Sending direct request to HuggingFace API...")
+        
+        response = requests.post(
+            API_URL, 
+            headers=headers, 
+            json=payload,
+            timeout=30
+        )
+        
         if response.status_code == 401:
             return "Authentication error. Please check your API Token."
         elif response.status_code == 429:
@@ -135,38 +216,23 @@ def call_deepseek(history: list) -> str:
         elif response.status_code != 200:
             return f"Server error: {response.status_code}"
         
-        # Process successful response
         result = response.json()
         raw_reply = result["choices"][0]["message"]["content"]
         
-        logger.info(f"Received raw reply: {raw_reply[:100]}...")
-        
-        # Apply Guardrails validation
-        final_reply = validate_with_guardrails(raw_reply)
-        
-        logger.info("Request processed successfully")
-        return final_reply
+        return clean_medical_response(raw_reply)
         
     except requests.exceptions.Timeout:
-        logger.error("Request timeout")
         return "Request timeout. Please try again."
-    
     except requests.exceptions.ConnectionError:
-        logger.error("Connection error")
-        return "Connection error with server. Please check your internet."
-    
-    except KeyError as e:
-        logger.error(f"Unexpected response structure: {e}")
-        return "Sorry, there's an issue with the response format from the model."
-    
+        return "Connection error. Please check your internet."
     except Exception as e:
         logger.exception(f"Unexpected error: {e}")
         return "Sorry, an unexpected error occurred. Please try again later."
 
 def clean_medical_response(text: str) -> str:
-    """Clean and format medical response to pass Guardrails validation"""
+    """Clean and format medical response"""
     
-    # Remove any markdown formatting
+    # Remove markdown formatting
     text = text.replace('**', '').replace('*', '').replace('`', '')
     text = text.replace('#', '').strip()
     
@@ -179,17 +245,16 @@ def clean_medical_response(text: str) -> str:
         except:
             pass
     
-    # Remove code block markers
     text = text.replace('```', '').strip()
     
-    # Ensure the response is within length limits (10-2000 chars)
+    # Ensure length limits
     if len(text) < 10:
-        text = "I understand your health concern. " + text
+        text = "I understand your concern. " + text
     
     if len(text) > 2000:
         text = text[:1997] + "..."
     
-    # Add medical disclaimer if not present
+    # Add disclaimer if missing
     disclaimer_phrases = [
         "consult a doctor", "consult with a healthcare professional", 
         "talk to your doctor", "seek medical advice", "healthcare provider",
@@ -197,7 +262,7 @@ def clean_medical_response(text: str) -> str:
     ]
     
     has_disclaimer = any(phrase in text.lower() for phrase in disclaimer_phrases)
-    if not has_disclaimer:
+    if not has_disclaimer and "i can only help with general health questions" not in text.lower():
         text += " Please consult with a healthcare professional for personalized medical advice."
     
     return text
@@ -233,8 +298,8 @@ async def chat(request: ChatRequest):
         
         logger.info(f"User message: {request.message}")
         
-        # Call the model
-        reply = call_deepseek(history)
+        # Call the model with Guardrails
+        reply = call_deepseek_with_guard(request.message, history)
         
         logger.info("Request processed successfully")
         return ChatResponse(reply=reply, status="success")
