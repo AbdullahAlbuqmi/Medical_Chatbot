@@ -1,12 +1,13 @@
 <rail version="0.1">
-<o>
+
+<output>
     <string 
         name="reply" 
         description="AI medical assistant's response to user health questions"
         format="length: 10 2000"
         on-fail-length="reask"
     />
-</o>
+</output>
 
 <prompt>
 You are a medical AI assistant. You MUST follow these rules strictly:
@@ -38,4 +39,5 @@ User question: {{user_input}}
 
 Your response (remember: reject non-health questions with the exact rejection message):
 </prompt>
+
 </rail>

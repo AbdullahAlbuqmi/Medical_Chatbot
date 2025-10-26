@@ -44,43 +44,9 @@ try:
     guard = Guard.from_rail("medical_guard.rail")
     logger.info("Guardrails loaded successfully from medical_guard.rail")
 except Exception as e:
-    logger.warning(f"Could not load RAIL file: {e}")
-    try:
-        # Fallback: Create guard programmatically
-        from guardrails import Guard
-        from pydantic import BaseModel, Field
-        
-        class MedicalResponse(BaseModel):
-            reply: str = Field(
-                description="AI medical assistant's response",
-                min_length=10,
-                max_length=2000
-            )
-        
-        guard = Guard.from_pydantic(
-            output_class=MedicalResponse,
-            prompt="""You are a medical AI assistant. You MUST follow these rules strictly:
-
-CRITICAL: If the user's question is NOT about health, medical topics, wellness, symptoms, or healthcare, you MUST respond with EXACTLY this text:
-"I can only help with general health questions. Please consult a healthcare professional for medical advice."
-
-For health-related questions:
-1. Provide general health information and education only
-2. Do not give personal medical diagnoses or specific treatment advice
-3. Do not prescribe medications or suggest specific dosages
-4. Always include a reminder to consult with healthcare professionals
-5. Use simple, clear language (50-300 words)
-6. Never use markdown, JSON, or code formatting - plain text only
-7. Be empathetic, supportive, and non-judgmental
-
-User question: {{user_input}}
-
-Your response:"""
-        )
-        logger.info("Guardrails created programmatically")
-    except Exception as e2:
-        logger.error(f"Failed to create Guardrails: {e2}")
-        guard = None
+    logger.error(f"Could not load RAIL file: {e}")
+    logger.info("Continuing without Guardrails - will use direct validation")
+    guard = None
 
 # Data models
 class ChatRequest(BaseModel):
