@@ -1,6 +1,7 @@
 import os
 import requests
 import logging
+import json
 from fastapi import FastAPI, HTTPException
 from pydantic import BaseModel
 from fastapi.middleware.cors import CORSMiddleware
@@ -48,11 +49,12 @@ class ChatResponse(BaseModel):
     reply: str
     status: str
 
-# Fixed function to call DeepSeek with Guardrails
+# Improved function to call DeepSeek with Guardrails
 def call_deepseek(history: list) -> str:
     """Send conversation history to HF model with Guardrails application"""
     
     try:
+        # Prepare the payload
         payload = {
             "messages": history,
             "model": "deepseek-ai/DeepSeek-V3.2-Exp:novita",
@@ -60,7 +62,7 @@ def call_deepseek(history: list) -> str:
             "temperature": 0.7
         }
         
-        logger.info(f"Sending request to HuggingFace API...")
+        logger.info("Sending request to HuggingFace API...")
         
         response = requests.post(
             API_URL, 
@@ -90,28 +92,49 @@ def call_deepseek(history: list) -> str:
             try:
                 logger.info("Applying Guardrails validation...")
                 
-                # Correct way: pass raw text to Guardrails for parsing
-                validation_result = guard.parse(raw_reply)
-                
-                # Extract final reply
-                if hasattr(validation_result, 'validated_output') and validation_result.validated_output:
-                    if hasattr(validation_result.validated_output, 'reply'):
-                        final_reply = validation_result.validated_output.reply
-                    elif isinstance(validation_result.validated_output, dict) and 'reply' in validation_result.validated_output:
-                        final_reply = validation_result.validated_output['reply']
-                    else:
-                        final_reply = str(validation_result.validated_output)
+                # Method 1: Try direct parsing first
+                try:
+                    validation_result = guard.parse(raw_reply)
                     
-                    logger.info(f"Reply after validation: {final_reply[:100]}...")
-                    return final_reply
-                else:
-                    # If validation fails, use raw reply with warning
-                    logger.warning("Guardrails validation failed, using raw reply")
-                    return f"{raw_reply}\n\nNote: This response was not validated according to medical rules"
+                    if validation_result.validation_passed:
+                        final_reply = validation_result.validated_output.get('reply', raw_reply)
+                        logger.info(f"Reply after validation: {final_reply[:100]}...")
+                        return final_reply
+                    else:
+                        logger.warning("Direct parsing failed, trying structured approach")
+                        raise ValueError("Direct parsing failed")
+                        
+                except Exception as e:
+                    logger.warning(f"Direct parsing failed: {e}, trying structured approach")
+                    
+                    # Method 2: Create structured output for Guardrails
+                    structured_output = {"reply": raw_reply}
+                    
+                    # Validate the structured output
+                    validation_result = guard.validate(structured_output)
+                    
+                    if validation_result.validation_passed:
+                        final_reply = validation_result.validated_output.get('reply', raw_reply)
+                        logger.info(f"Reply after structured validation: {final_reply[:100]}...")
+                        return final_reply
+                    else:
+                        # If validation fails, check why and try to fix
+                        logger.warning(f"Validation errors: {validation_result.error}")
+                        
+                        # Method 3: Manual validation and cleaning
+                        cleaned_reply = clean_medical_response(raw_reply)
+                        validation_result = guard.validate({"reply": cleaned_reply})
+                        
+                        if validation_result.validation_passed:
+                            final_reply = validation_result.validated_output.get('reply', cleaned_reply)
+                            logger.info(f"Reply after cleaning: {final_reply[:100]}...")
+                            return final_reply
+                        else:
+                            logger.warning("All validation methods failed, using raw reply with warning")
+                            return f"{raw_reply}\n\nNote: This response was not validated according to medical safety rules."
                     
             except Exception as e:
-                logger.error(f"Error in Guardrails: {e}")
-                # In case of error, return raw reply
+                logger.error(f"Error in Guardrails processing: {e}")
                 return raw_reply
         else:
             # If Guardrails not loaded, return raw reply
@@ -132,6 +155,31 @@ def call_deepseek(history: list) -> str:
     except Exception as e:
         logger.exception(f"Unexpected error: {e}")
         return "Sorry, an unexpected error occurred. Please try again later."
+
+def clean_medical_response(text: str) -> str:
+    """Clean and format medical response to pass Guardrails validation"""
+    
+    # Remove any markdown formatting
+    text = text.replace('**', '').replace('*', '').replace('`', '')
+    
+    # Ensure the response is within length limits
+    if len(text) < 10:
+        text = "I understand your health concern. " + text
+    
+    if len(text) > 2000:
+        text = text[:1997] + "..."
+    
+    # Add medical disclaimer if not present
+    disclaimer_phrases = [
+        "consult a doctor", "consult with a healthcare professional", 
+        "talk to your doctor", "seek medical advice"
+    ]
+    
+    has_disclaimer = any(phrase in text.lower() for phrase in disclaimer_phrases)
+    if not has_disclaimer:
+        text += " Please consult with a healthcare professional for personalized medical advice."
+    
+    return text
 
 # Root endpoint
 @app.get("/")
